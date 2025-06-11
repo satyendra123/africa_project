@@ -1,0 +1,176 @@
+#include <SPI.h>
+#include <Ethernet.h>
+#include <avr/pgmspace.h>
+
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x01 };
+IPAddress ip(192, 168, 1, 151);
+IPAddress flaskServerIp(192, 168, 1, 100);  // Replace with your Flask IP
+EthernetServer server(80);
+EthernetClient client;
+
+const int relayPin = 9;
+const unsigned long readTimeout = 1000;
+const unsigned long reconnectDelay = 5000;
+
+const char* trigger = "|OPENEN%";
+const char* flaskApi = "http://192.168.1.100:5000/api/login"; // Replace with Flask IP
+
+const char loginPage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Login - Gate Controller</title>
+  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+<body class="bg-gray-100 h-screen flex items-center justify-center">
+  <div class="bg-white p-8 rounded shadow-md w-full max-w-sm">
+    <h2 class="text-2xl font-bold mb-4 text-center text-gray-800">Gate Login</h2>
+    <div id="msg" class="text-red-500 text-sm mb-2 hidden">Login failed. Please try again.</div>
+    <input id="username" type="text" placeholder="Username" class="w-full p-2 border border-gray-300 mb-4 rounded" />
+    <input id="password" type="password" placeholder="Password" class="w-full p-2 border border-gray-300 mb-4 rounded" />
+    <button onclick="login()" class="bg-blue-600 text-white px-4 py-2 w-full rounded hover:bg-blue-700">Login</button>
+  </div>
+
+  <script>
+    function login() {
+      const username = document.getElementById('username').value;
+      const password = document.getElementById('password').value;
+
+      axios.post('%FLASK_API%', {
+        username: username,
+        password: password
+      })
+      .then(response => {
+        if (response.data.status === 'ok') {
+          window.location.href = '/config';
+        } else {
+          document.getElementById('msg').classList.remove('hidden');
+        }
+      })
+      .catch(error => {
+        console.error('Login error:', error);
+        document.getElementById('msg').classList.remove('hidden');
+      });
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+String parseHTMLTemplate() {
+  String html;
+  const char* ptr = loginPage;
+  while (pgm_read_byte(ptr)) {
+    html += (char)pgm_read_byte(ptr++);
+  }
+  html.replace("%FLASK_API%", flaskApi);
+  return html;
+}
+
+void serveLoginPage(EthernetClient& client) {
+  String html = parseHTMLTemplate();
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+  client.println(html);
+}
+
+void checkBoomSig() {
+  if (client.connect(flaskServerIp, 5000)) {
+    Serial.println("Connected to Flask for /check_boomsig");
+
+    client.println("GET /check_boomsig?gate_id=1 HTTP/1.1");
+    client.println("Host: 192.168.1.100");
+    client.println("Connection: close");
+    client.println();
+
+    unsigned long startTime = millis();
+    int matchIndex = 0;
+    bool gateOpen = false;
+
+    while (millis() - startTime < readTimeout && client.connected()) {
+      if (client.available()) {
+        char c = client.read();
+        Serial.write(c);
+
+        if (c == trigger[matchIndex]) {
+          matchIndex++;
+          if (trigger[matchIndex] == '\0') {
+            gateOpen = true;
+            break;
+          }
+        } else {
+          matchIndex = (c == trigger[0]) ? 1 : 0;
+        }
+      }
+    }
+
+    client.stop();
+
+    if (gateOpen) {
+      Serial.println("\nGate open command detected.");
+      digitalWrite(relayPin, LOW);
+      delay(500);
+      digitalWrite(relayPin, HIGH);
+    } else {
+      Serial.println("\nNo gate open command found.");
+    }
+  } else {
+    Serial.println("Connection to Flask failed");
+  }
+}
+
+void setup() {
+  Ethernet.begin(mac, ip);
+  server.begin();
+  Serial.begin(9600);
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, HIGH);
+  Serial.print("Login Web UI: http://");
+  Serial.println(Ethernet.localIP());
+}
+
+void loop() {
+  // Serve web interface
+  EthernetClient webClient = server.available();
+  if (webClient) {
+    boolean currentLineIsBlank = true;
+    String request = "";
+
+    while (webClient.connected()) {
+      if (webClient.available()) {
+        char c = webClient.read();
+        request += c;
+        if (c == '\n' && currentLineIsBlank) {
+          if (request.indexOf("GET / ") >= 0) {
+            serveLoginPage(webClient);
+          } else {
+            webClient.println("HTTP/1.1 404 Not Found");
+            webClient.println("Content-Type: text/plain");
+            webClient.println();
+            webClient.println("404 Not Found");
+          }
+          break;
+        }
+        if (c == '\n') {
+          currentLineIsBlank = true;
+        } else if (c != '\r') {
+          currentLineIsBlank = false;
+        }
+      }
+    }
+    delay(1);
+    webClient.stop();
+  }
+
+  // Call boomsig every few seconds
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > reconnectDelay) {
+    lastCheck = millis();
+    checkBoomSig();
+  }
+}
