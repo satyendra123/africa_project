@@ -1,0 +1,156 @@
+#include <SPI.h>
+#include <Ethernet.h>
+
+byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x01};
+IPAddress ip(192, 168, 1, 151);
+IPAddress serverIp(18, 206, 180, 79);
+EthernetClient client;
+
+const int relayPin = 9;
+const unsigned long readTimeout = 1000;
+const unsigned long reconnectDelay = 5000;
+
+const char* trigger = "|OPENEN%";
+
+void setup() {
+  Ethernet.begin(mac, ip);
+  Serial.begin(9600);
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, HIGH);
+}
+
+void loop() {
+  if (client.connect(serverIp, 8000)) {
+    Serial.println("Connected to server");
+
+    client.println("GET /check_boomsig?gate_id=1 HTTP/1.1");
+    client.println("Host: 18.206.180.79");
+    client.println("Connection: close");
+    client.println();
+
+    unsigned long startTime = millis();
+    int matchIndex = 0;
+    bool gateOpen = false;
+
+    while (millis() - startTime < readTimeout && client.connected()) {
+      if (client.available()) {
+        char c = client.read();
+        Serial.write(c);
+
+        if (c == trigger[matchIndex]) {
+          matchIndex++;
+          if (trigger[matchIndex] == '\0') {
+            gateOpen = true;
+            break;
+          }
+        } else {
+          matchIndex = (c == trigger[0]) ? 1 : 0;
+        }
+      }
+    }
+
+    client.stop();
+
+    if (gateOpen) {
+      Serial.println("\nGate open command detected.");
+      digitalWrite(relayPin, LOW);
+      delay(500);
+      digitalWrite(relayPin, HIGH);
+    } else {
+      Serial.println("\nNo gate open command found.");
+    }
+  } else {
+    Serial.println("Connection to server failed");
+  }
+
+  delay(reconnectDelay);
+}
+
+
+
+
+from flask import Flask, request, jsonify
+import mysql.connector
+
+app = Flask(__name__)
+
+def get_db_connection():
+    return mysql.connector.connect(host='localhost', user='root', password='', database='auto_boom')
+
+@app.route('/check_boomsig', methods=['GET'])
+def check_boom_signal():
+    gate_id = request.args.get('gate_id')
+
+    if not gate_id:
+        return jsonify({"error": "Missing gate_id"}), 400
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        query = 'SELECT entryboom, exitboom FROM boomsig WHERE id = %s'
+        cursor.execute(query, (gate_id,))
+        row = cursor.fetchone()
+        print(f"Gate ID {gate_id} Status: {row}")
+
+        if not row:
+            return jsonify({"error": "Gate ID not found"}), 404
+
+        entryboom, exitboom = row
+
+        if entryboom == 'Y':
+            reset_query = 'UPDATE boomsig SET entryboom = "N" WHERE id = %s'
+            cursor.execute(reset_query, (gate_id,))
+            conn.commit()
+            conn.close()
+            return jsonify({"command": "|OPENEN%"}), 200
+
+        elif exitboom == 'Y':
+            reset_query = 'UPDATE boomsig SET exitboom = "N" WHERE id = %s'
+            cursor.execute(reset_query, (gate_id,))
+            conn.commit()
+            conn.close()
+            return jsonify({"command": "|OPENEX%"}), 200
+
+        conn.close()
+        return jsonify({"command": "NO_ACTION"}), 200
+
+    except mysql.connector.Error as err:
+        print(f"MySQL Error: {err}")
+        return jsonify({"error": f"MySQL Error: {err}"}), 500
+
+
+
+@app.route('/barrier_control', methods=['POST'])
+def update_boom_signal():
+    try:
+        data = request.get_json()
+        gate_id = data.get("gate_id")
+        action = data.get("action")
+
+        if not gate_id or action not in ["open", "close"]:
+            return jsonify({"error": "Missing or invalid gate_id/action"}), 400
+
+        column_name = "entryboom" if action == "open" else "exitboom"
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        update_query = f'UPDATE boomsig SET {column_name} = "Y" WHERE id = %s'
+        cursor.execute(update_query, (gate_id,))
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "status": f"{action} command recorded",
+            "updated_column": column_name,
+            "gate_id": gate_id
+        }), 200
+
+    except Exception as e:
+        print(f"Exception: {e}")
+        return jsonify({"error": str(e)}), 500
+
+        
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
