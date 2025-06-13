@@ -1,3 +1,4 @@
+// africa deployed code and it is working. this is dynamic we can change the gate_id through webpage. and it's password set is admin. 
 #include <SPI.h>
 #include <Ethernet.h>
 #include <EEPROM.h>
