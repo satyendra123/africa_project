@@ -1,176 +1,313 @@
 #include <SPI.h>
 #include <Ethernet.h>
+#include <EEPROM.h>
 #include <avr/pgmspace.h>
 
+#ifndef FPSTR
+#define FPSTR(pstr_pointer) (reinterpret_cast<const __FlashStringHelper *>(pstr_pointer))
+#endif
+
+// Function declarations
+String readGateIdFromEEPROM();
+void writeGateIdToEEPROM(String id);
+void handleClientRequest();
+
+// Network config
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x01 };
 IPAddress ip(192, 168, 1, 151);
-IPAddress flaskServerIp(192, 168, 1, 100);  // Replace with your Flask IP
-EthernetServer server(80);
-EthernetClient client;
+IPAddress serverIp(18, 206, 180, 79);
 
-const int relayPin = 9;
+EthernetClient client;
+EthernetServer server(80);
+
+const int openRelayPin = 9;
+const int closeRelayPin = 8;
 const unsigned long readTimeout = 1000;
 const unsigned long reconnectDelay = 5000;
 
-const char* trigger = "|OPENEN%";
-const char* flaskApi = "http://192.168.1.100:5000/api/login"; // Replace with Flask IP
+const char* openTrigger = "|OPENEN%";
+static const char* closeTrigger = "|OPENEX%";
 
-const char loginPage[] PROGMEM = R"rawliteral(
+String gateId = "";
+
+// HTML pages
+const char gateFormPage[] PROGMEM = R"rawliteral(
+HTTP/1.1 200 OK
+Content-Type: text/html
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Login - Gate Controller</title>
-  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
-  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-</head>
-<body class="bg-gray-100 h-screen flex items-center justify-center">
-  <div class="bg-white p-8 rounded shadow-md w-full max-w-sm">
-    <h2 class="text-2xl font-bold mb-4 text-center text-gray-800">Gate Login</h2>
-    <div id="msg" class="text-red-500 text-sm mb-2 hidden">Login failed. Please try again.</div>
-    <input id="username" type="text" placeholder="Username" class="w-full p-2 border border-gray-300 mb-4 rounded" />
-    <input id="password" type="password" placeholder="Password" class="w-full p-2 border border-gray-300 mb-4 rounded" />
-    <button onclick="login()" class="bg-blue-600 text-white px-4 py-2 w-full rounded hover:bg-blue-700">Login</button>
-  </div>
-
-  <script>
-    function login() {
-      const username = document.getElementById('username').value;
-      const password = document.getElementById('password').value;
-
-      axios.post('%FLASK_API%', {
-        username: username,
-        password: password
-      })
-      .then(response => {
-        if (response.data.status === 'ok') {
-          window.location.href = '/config';
-        } else {
-          document.getElementById('msg').classList.remove('hidden');
-        }
-      })
-      .catch(error => {
-        console.error('Login error:', error);
-        document.getElementById('msg').classList.remove('hidden');
-      });
+  <meta charset="UTF-8">
+  <title>Gate ID Setup</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <style>
+    body {
+      background-color: #1a202c;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+      font-family: Arial, sans-serif;
     }
-  </script>
+    .container {
+      background-color: #ffffff;
+      border-radius: 1rem;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+      padding: 2rem;
+      width: 100%;
+      max-width: 400px;
+    }
+    h2 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      color: #ffffff;
+      text-align: center;
+      margin-bottom: 1.5rem;
+    }
+    input {
+      border: 1px solid #d1d5db;
+      padding: 0.75rem;
+      border-radius: 0.375rem;
+      width: 100%;
+      margin-bottom: 1rem;
+      box-sizing: border-box;
+    }
+    button {
+      background-color: #2563eb;
+      color: #ffffff;
+      font-weight: 500;
+      padding: 0.75rem;
+      border: none;
+      border-radius: 0.375rem;
+      cursor: pointer;
+      width: 100%;
+    }
+    button:hover {
+      background-color: #1d4ed8;
+    }
+  </style>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-900 min-h-screen flex justify-center items-center">
+  <div class="bg-white rounded-2xl shadow-xl p-8 w-full max-w-md">
+    <h2 class="text-2xl font-semibold mb-6 text-center text-gray-800">Gate Setup</h2>
+    <form method="POST" class="flex flex-col space-y-4">
+      <input type="text" name="gate_id" class="border border-gray-300 p-3 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Gate ID (e.g. 1)" required>
+      <input type="password" name="password" class="border border-gray-300 p-3 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Password" required>
+      <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 rounded-md transition duration-200">Save</button>
+    </form>
+  </div>
 </body>
 </html>
 )rawliteral";
 
-String parseHTMLTemplate() {
-  String html;
-  const char* ptr = loginPage;
-  while (pgm_read_byte(ptr)) {
-    html += (char)pgm_read_byte(ptr++);
+
+const char errorPage[] PROGMEM = R"rawliteral(
+HTTP/1.1 200 OK
+Content-Type: text/html
+
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Invalid Password</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-red-100 flex justify-center items-center h-screen">
+  <div class="bg-white p-8 rounded shadow-md text-center">
+    <h2 class="text-xl font-bold text-red-600 mb-4">Invalid Password</h2>
+    <a href="/" class="text-blue-500 underline">Try Again</a>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+void setup() {
+  Ethernet.begin(mac, ip);
+  server.begin();
+
+  Serial.begin(9600);
+pinMode(openRelayPin, OUTPUT);
+pinMode(closeRelayPin, OUTPUT);
+digitalWrite(openRelayPin, HIGH);
+digitalWrite(closeRelayPin, HIGH);
+
+  delay(1000);
+
+  gateId = readGateIdFromEEPROM();
+  if (gateId == "") {
+    gateId = "1";
+    writeGateIdToEEPROM(gateId);
+    Serial.println("EEPROM empty. Default gate_id = 1 saved.");
+  } else {
+    Serial.println("Loaded gate_id from EEPROM: " + gateId);
   }
-  html.replace("%FLASK_API%", flaskApi);
-  return html;
 }
 
-void serveLoginPage(EthernetClient& client) {
-  String html = parseHTMLTemplate();
-  client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: text/html");
-  client.println("Connection: close");
-  client.println();
-  client.println(html);
-}
+void loop() {
+  handleClientRequest();
 
-void checkBoomSig() {
-  if (client.connect(flaskServerIp, 5000)) {
-    Serial.println("Connected to Flask for /check_boomsig");
+  if (client.connect(serverIp, 8000)) {
+    Serial.println("Connected to server");
 
-    client.println("GET /check_boomsig?gate_id=1 HTTP/1.1");
-    client.println("Host: 192.168.1.100");
+    client.print("GET /check_boomsig?gate_id=");
+    client.print(gateId);
+    client.println(" HTTP/1.1");
+    client.println("Host: 18.206.180.79");
     client.println("Connection: close");
     client.println();
 
     unsigned long startTime = millis();
-    int matchIndex = 0;
-    bool gateOpen = false;
+    int matchOpen = 0;
+    int matchClose = 0;
+    bool openGate = false;
+    bool closeGate = false;
 
     while (millis() - startTime < readTimeout && client.connected()) {
       if (client.available()) {
         char c = client.read();
         Serial.write(c);
 
-        if (c == trigger[matchIndex]) {
-          matchIndex++;
-          if (trigger[matchIndex] == '\0') {
-            gateOpen = true;
+        // Match for |OPENEN%
+        if (c == openTrigger[matchOpen]) {
+          matchOpen++;
+          if (openTrigger[matchOpen] == '\0') {
+            openGate = true;
             break;
           }
         } else {
-          matchIndex = (c == trigger[0]) ? 1 : 0;
+          matchOpen = (c == openTrigger[0]) ? 1 : 0;
+        }
+
+        // Match for |OPENEX%
+        if (c == closeTrigger[matchClose]) {
+          matchClose++;
+          if (closeTrigger[matchClose] == '\0') {
+            closeGate = true;
+            break;
+          }
+        } else {
+          matchClose = (c == closeTrigger[0]) ? 1 : 0;
         }
       }
     }
 
     client.stop();
 
-    if (gateOpen) {
-      Serial.println("\nGate open command detected.");
-      digitalWrite(relayPin, LOW);
+    if (openGate) {
+      Serial.println("\nGate OPEN command received.");
+      digitalWrite(openRelayPin, LOW);
       delay(500);
-      digitalWrite(relayPin, HIGH);
+      digitalWrite(openRelayPin, HIGH);
+    } else if (closeGate) {
+      Serial.println("\nGate CLOSE command received.");
+      digitalWrite(closeRelayPin, LOW);
+      delay(500);
+      digitalWrite(closeRelayPin, HIGH);
     } else {
-      Serial.println("\nNo gate open command found.");
+      Serial.println("\nNo recognized gate command received.");
     }
+
   } else {
-    Serial.println("Connection to Flask failed");
+    Serial.println("Connection to server failed");
   }
+
+  delay(reconnectDelay);
 }
 
-void setup() {
-  Ethernet.begin(mac, ip);
-  server.begin();
-  Serial.begin(9600);
-  pinMode(relayPin, OUTPUT);
-  digitalWrite(relayPin, HIGH);
-  Serial.print("Login Web UI: http://");
-  Serial.println(Ethernet.localIP());
-}
 
-void loop() {
-  // Serve web interface
+void handleClientRequest() {
   EthernetClient webClient = server.available();
   if (webClient) {
-    boolean currentLineIsBlank = true;
+    Serial.println("Web client connected");
     String request = "";
+    String body = "";
+
+    bool isPost = false;
+    int contentLength = 0;
 
     while (webClient.connected()) {
       if (webClient.available()) {
         char c = webClient.read();
         request += c;
-        if (c == '\n' && currentLineIsBlank) {
-          if (request.indexOf("GET / ") >= 0) {
-            serveLoginPage(webClient);
-          } else {
-            webClient.println("HTTP/1.1 404 Not Found");
-            webClient.println("Content-Type: text/plain");
-            webClient.println();
-            webClient.println("404 Not Found");
-          }
-          break;
-        }
-        if (c == '\n') {
-          currentLineIsBlank = true;
-        } else if (c != '\r') {
-          currentLineIsBlank = false;
-        }
+
+        if (request.endsWith("\r\n\r\n")) break;
       }
     }
+
+    if (request.startsWith("POST /")) {
+      isPost = true;
+
+      int clIndex = request.indexOf("Content-Length: ");
+      if (clIndex != -1) {
+        int clEnd = request.indexOf("\r\n", clIndex);
+        String clValue = request.substring(clIndex + 16, clEnd);
+        contentLength = clValue.toInt();
+      }
+
+      unsigned long timeout = millis();
+      while (webClient.available() < contentLength && millis() - timeout < 1000);
+
+      for (int i = 0; i < contentLength; i++) {
+        char c = webClient.read();
+        body += c;
+      }
+
+      Serial.println("POST body: " + body);
+
+      int gateIdIdx = body.indexOf("gate_id=");
+      int passIdx = body.indexOf("&password=");
+
+      if (gateIdIdx != -1 && passIdx != -1) {
+        String newId = body.substring(gateIdIdx + 8, passIdx);
+        String password = body.substring(passIdx + 10);
+
+        newId.trim();
+        password.trim();
+
+        Serial.println("Gate ID: " + newId);
+        Serial.println("Password: " + password);
+
+        if (password == "admin") {
+          gateId = newId;
+          writeGateIdToEEPROM(gateId);
+          Serial.println("Gate ID updated: " + gateId);
+          webClient.print(FPSTR(gateFormPage));
+        } else {
+          Serial.println("Invalid password attempt");
+          webClient.print(FPSTR(errorPage));
+        }
+      } else {
+        webClient.print(FPSTR(errorPage));
+      }
+
+    } else {
+      webClient.print(FPSTR(gateFormPage));
+    }
+
     delay(1);
     webClient.stop();
+    Serial.println("Client disconnected");
   }
+}
 
-  // Call boomsig every few seconds
-  static unsigned long lastCheck = 0;
-  if (millis() - lastCheck > reconnectDelay) {
-    lastCheck = millis();
-    checkBoomSig();
+
+void writeGateIdToEEPROM(String id) {
+  int len = id.length();
+  EEPROM.write(0, len);
+  for (int i = 0; i < len; i++) {
+    EEPROM.write(i + 1, id[i]);
   }
+}
+
+String readGateIdFromEEPROM() {
+  int len = EEPROM.read(0);
+  if (len <= 0 || len > 20 || len == 0xFF) return "";
+  String id = "";
+  for (int i = 0; i < len; i++) {
+    id += char(EEPROM.read(i + 1));
+  }
+  return id;
 }
