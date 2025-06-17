@@ -1,0 +1,172 @@
+// in this we are not doing anything. everything will be managed by the server. in this my arduino will hit the api once and get the config and store it into the eeprom memory so everytime it needs to update it
+#include <SPI.h>
+#include <Ethernet.h>
+#include <EEPROM.h>
+
+IPAddress defaultIP(192, 168, 1, 151);
+IPAddress server(18, 206, 180, 79);
+const char defaultGateID[] = "1";
+
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x01 };
+char gate_id[16];
+IPAddress myIP;
+
+const int openRelayPin = 9;
+const int closeRelayPin = 8;
+
+EthernetClient client;
+
+const unsigned long reconnectDelay = 3000;
+const unsigned long readTimeout = 1000;
+unsigned long lastCheckTime = 0;
+
+void saveIPToEEPROM(IPAddress ip) {
+  for (int i = 0; i < 4; i++)
+    EEPROM.write(20 + i, ip[i]);
+}
+
+IPAddress readIPFromEEPROM() {
+  return IPAddress(EEPROM.read(20), EEPROM.read(21), EEPROM.read(22), EEPROM.read(23));
+}
+
+void saveGateIDToEEPROM(const char* id) {
+  for (int i = 0; i < 15; i++)
+    EEPROM.write(i, id[i]);
+  EEPROM.write(15, '\0');
+}
+
+void readGateIDFromEEPROM(char* buffer) {
+  for (int i = 0; i < 15; i++) buffer[i] = EEPROM.read(i);
+  buffer[15] = '\0';
+}
+
+bool isEEPROMConfigured() {
+  char c = EEPROM.read(0);
+  return isalnum(c);
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(openRelayPin, OUTPUT);
+  pinMode(closeRelayPin, OUTPUT);
+  digitalWrite(openRelayPin, LOW);
+  digitalWrite(closeRelayPin, LOW);
+
+  if (isEEPROMConfigured()) {
+    readGateIDFromEEPROM(gate_id);
+    myIP = readIPFromEEPROM();
+  } else {
+    strcpy(gate_id, defaultGateID);
+    myIP = defaultIP;
+    saveGateIDToEEPROM(defaultGateID);
+    saveIPToEEPROM(defaultIP);
+  }
+
+  Serial.print("Using IP: "); Serial.println(myIP);
+  Serial.print("Gate ID: "); Serial.println(gate_id);
+
+  Ethernet.begin(mac, myIP);
+  delay(1000);
+  registerAndCheckConfig();
+  lastCheckTime = millis();
+}
+
+void loop() {
+  if (millis() - lastCheckTime >= reconnectDelay) {
+    checkBoomSignal();
+    lastCheckTime = millis();
+  }
+}
+
+void registerAndCheckConfig() {
+  if (client.connect(server, 8000)) {
+    String json = "{\"mac\":\"DE:AD:BE:EF:FE:01\",\"gate_id\":\"" + String(gate_id) + "\",\"ip\":\"" + String(myIP) + "\"}";
+
+    client.println("POST /register_controller HTTP/1.1");
+    client.println("Host: server");
+    client.println("Content-Type: application/json");
+    client.print("Content-Length: ");
+    client.println(json.length());
+    client.println();
+    client.print(json);
+
+    unsigned long start = millis();
+    String response = "";
+    while (millis() - start < readTimeout) {
+      while (client.available()) {
+        response += client.readStringUntil('\n');
+      }
+    }
+
+    client.stop();
+    Serial.println("Config Response:");
+    Serial.println(response);
+
+    if (response.indexOf("{") != -1) {
+      int ipStart = response.indexOf("\"ip\":\"") + 6;
+      int ipEnd = response.indexOf("\"", ipStart);
+      String newIP = response.substring(ipStart, ipEnd);
+
+      int gidStart = response.indexOf("\"gate_id\":\"") + 11;
+      int gidEnd = response.indexOf("\"", gidStart);
+      String newGate = response.substring(gidStart, gidEnd);
+
+      if (newIP != String(myIP) || newGate != String(gate_id)) {
+        IPAddress new_ip;
+        sscanf(newIP.c_str(), "%hhu.%hhu.%hhu.%hhu", &new_ip[0], &new_ip[1], &new_ip[2], &new_ip[3]);
+
+        saveIPToEEPROM(new_ip);
+        saveGateIDToEEPROM(newGate.c_str());
+
+        Serial.println("Updated config received. Rebooting...");
+        delay(2000);
+        asm volatile ("jmp 0");
+      }
+    }
+  } else {
+    Serial.println("Failed to register controller.");
+  }
+}
+
+void checkBoomSignal() {
+  if (client.connect(server, 8000)) {
+    client.print("GET /check_boomsig?gate_id=");
+    client.print(gate_id);
+    client.println(" HTTP/1.1");
+    client.println("Host: server");
+    client.println("Connection: close");
+    client.println();
+
+    unsigned long start = millis();
+    String response = "";
+    while (millis() - start < readTimeout) {
+      while (client.available()) {
+        response += client.read();
+      }
+    }
+
+    client.stop();
+    Serial.println("Boom Signal Response:");
+    Serial.println(response);
+
+    if (response.indexOf("|OPENEN%") != -1) {
+      triggerOpenBarrier();
+    } else if (response.indexOf("|OPENEX%") != -1) {
+      triggerCloseBarrier();
+    }
+  } else {
+    Serial.println("Failed to connect to server.");
+  }
+}
+
+void triggerOpenBarrier() {
+  digitalWrite(openRelayPin, HIGH);
+  delay(500);
+  digitalWrite(openRelayPin, LOW);
+}
+
+void triggerCloseBarrier() {
+  digitalWrite(closeRelayPin, HIGH);
+  delay(500);
+  digitalWrite(closeRelayPin, LOW);
+}
