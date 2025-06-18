@@ -1,3 +1,6 @@
+// this code is worked from anywhere in the world. we can change the ip, port, add, edit, delete the controller from anywhere in the world. 
+// my arduino is having a mac address a unique. and with the mac address it will hit the api. and get the config details in the setup and after that 
+// it will send the api with the config details
 #include <SPI.h>
 #include <Ethernet.h>
 
