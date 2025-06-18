@@ -1,0 +1,1074 @@
+#include <SPI.h>
+#include <Ethernet.h>
+#include <EEPROM.h>
+
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x01 };
+const char macStr[] = "DE:AD:BE:EF:FE:01";
+
+IPAddress fallbackIP(192, 168, 1, 151);
+IPAddress fallbackConfigServerIP(192, 168, 1, 100);
+int fallbackConfigServerPort = 8000;
+
+EthernetClient client;
+
+const int openRelayPin = 9;
+const int closeRelayPin = 8;
+
+const unsigned long reconnectDelay = 3000;
+const unsigned long readTimeout = 2000;
+unsigned long lastCheckTime = 0;
+
+struct DynamicConfig {
+  IPAddress deviceIP;
+  char gate_id[16];
+  char server[32];
+  int port;
+  char base_url[128];
+  char config_server[32];
+  int config_port;
+} config;
+
+struct ServerConfig {
+  char server_ip[16];
+  uint16_t server_port;
+  char base_url[64];
+};
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(openRelayPin, OUTPUT);
+  pinMode(closeRelayPin, OUTPUT);
+  digitalWrite(openRelayPin, HIGH);
+  digitalWrite(closeRelayPin, HIGH);
+
+  Ethernet.begin(mac, fallbackIP);
+  delay(2000);
+
+  bool configLoaded = loadServerConfigFromEEPROM();
+  bool success = false;
+
+  if (configLoaded) {
+    Serial.println("EEPROM config found, trying to connect to saved server...");
+    success = tryFetchFromServer(config.server, config.port, 5);
+  }
+
+  if (!success) {
+    Serial.println("Using fallback server to fetch config...");
+    while (!fetchConfig(fallbackConfigServerIP, fallbackConfigServerPort)) {
+      Serial.println("Retrying config fetch from fallback in 5 seconds...");
+      delay(5000);
+    }
+    saveServerConfigToEEPROM();  // Save fallback-fetched config
+  }
+
+  Ethernet.begin(mac, config.deviceIP);
+  delay(2000);
+
+  Serial.print("Device IP: ");
+  Serial.println(Ethernet.localIP());
+
+  lastCheckTime = millis();
+}
+
+void loop() {
+  if (millis() - lastCheckTime >= reconnectDelay) {
+    if (strlen(config.server) > 6 && config.port > 0) {
+      checkBoomSignal();
+    } else {
+      Serial.println("Invalid config, skipping boom check...");
+    }
+    lastCheckTime = millis();
+  }
+}
+
+bool tryFetchFromServer(const char* serverIP, int port, int maxAttempts) {
+  IPAddress ip;
+  int ip1, ip2, ip3, ip4;
+
+  if (sscanf(serverIP, "%d.%d.%d.%d", &ip1, &ip2, &ip3, &ip4) != 4) {
+    Serial.println("Invalid IP format in EEPROM.");
+    return false;
+  }
+
+  ip = IPAddress(ip1, ip2, ip3, ip4);
+
+  for (int i = 0; i < maxAttempts; i++) {
+    Serial.print("Attempt ");
+    Serial.print(i + 1);
+    Serial.print(" to fetch config from saved server... ");
+    if (fetchConfig(ip, port)) {
+      Serial.println("Success.");
+      saveServerConfigToEEPROM();  // ✅ Save updated config
+      return true;
+    } else {
+      Serial.println("Failed.");
+      delay(3000);
+    }
+  }
+  return false;
+}
+
+bool loadServerConfigFromEEPROM() {
+  ServerConfig s;
+  EEPROM.get(0, s);
+
+  if (s.server_ip[0] == 0xFF || s.server_ip[0] == '\0') return false;
+
+  strncpy(config.server, s.server_ip, sizeof(config.server));
+  config.port = s.server_port;
+  strncpy(config.base_url, s.base_url, sizeof(config.base_url));
+
+  Serial.println("Loaded config from EEPROM:");
+  Serial.print("Server IP: "); Serial.println(config.server);
+  Serial.print("Port: "); Serial.println(config.port);
+  Serial.print("Base URL: "); Serial.println(config.base_url);
+  return true;
+}
+
+void saveServerConfigToEEPROM() {
+  ServerConfig s;
+  strncpy(s.server_ip, config.server, sizeof(s.server_ip));
+  s.server_port = config.port;
+  strncpy(s.base_url, config.base_url, sizeof(s.base_url));
+
+  EEPROM.put(0, s);
+  Serial.println("Saved server config to EEPROM.");
+}
+
+bool fetchConfig(IPAddress configServerIP, int configPort) {
+  client.stop();
+
+  if (client.connect(configServerIP, configPort)) {
+    String url = "/get_config?mac=" + String(macStr);
+    client.print("GET " + url + " HTTP/1.1\r\n");
+    client.print("Host: " + ipToString(configServerIP) + "\r\n");
+    client.print("Connection: close\r\n\r\n");
+
+    unsigned long start = millis();
+    String response = "";
+
+    while (millis() - start < readTimeout) {
+      while (client.available()) {
+        char c = client.read();
+        response += c;
+        start = millis();
+      }
+    }
+    client.stop();
+
+    Serial.println("Config Response:");
+    Serial.println(response);
+
+    int jsonStart = response.indexOf('{');
+    int jsonEnd = response.lastIndexOf('}');
+    if (jsonStart == -1 || jsonEnd == -1 || jsonEnd <= jsonStart) return false;
+
+    String json = response.substring(jsonStart, jsonEnd + 1);
+    String ipStr = extractJsonValue(json, "ip");
+    String gidStr = extractJsonValue(json, "gate_id");
+    String srvStr = extractJsonValue(json, "server_ip");
+    String portStr = extractJsonValue(json, "server_port");
+    String apiStr = extractJsonValue(json, "base_url");
+
+    int ip1, ip2, ip3, ip4;
+    if (sscanf(ipStr.c_str(), "%d.%d.%d.%d", &ip1, &ip2, &ip3, &ip4) != 4) return false;
+    config.deviceIP = IPAddress(ip1, ip2, ip3, ip4);
+
+    gidStr.toCharArray(config.gate_id, sizeof(config.gate_id));
+    srvStr.toCharArray(config.server, sizeof(config.server));
+    config.port = portStr.toInt();
+    apiStr.toCharArray(config.base_url, sizeof(config.base_url));
+
+    srvStr.toCharArray(config.config_server, sizeof(config.config_server));
+    config.config_port = portStr.toInt();
+
+    Serial.print("Parsed server IP: ");
+    Serial.println(config.server);
+    Serial.print("Server port: ");
+    Serial.println(config.port);
+
+    return true;
+  } else {
+    Serial.println("Failed to connect to config API.");
+    return false;
+  }
+}
+
+void checkBoomSignal() {
+  client.stop();
+
+  IPAddress serverIP;
+  int ip1, ip2, ip3, ip4;
+  if (sscanf(config.server, "%d.%d.%d.%d", &ip1, &ip2, &ip3, &ip4) != 4) {
+    Serial.print("Invalid server IP: ");
+    Serial.println(config.server);
+    return;
+  }
+  serverIP = IPAddress(ip1, ip2, ip3, ip4);
+
+  if (client.connect(serverIP, config.port)) {
+    String ipStr = ipToString(config.deviceIP);
+    String url = "/check_boomsig?mac=" + String(macStr) + "&ip=" + ipStr + "&gate_id=" + String(config.gate_id);
+
+    Serial.print("Boom URL: ");
+    Serial.println(url);
+
+    client.print("GET " + url + " HTTP/1.1\r\n");
+    client.print("Host: " + String(config.server) + "\r\n");
+    client.print("Connection: close\r\n\r\n");
+
+    unsigned long start = millis();
+    String response = "";
+
+    while (millis() - start < readTimeout) {
+      while (client.available()) {
+        char c = client.read();
+        response += c;
+        start = millis();
+      }
+    }
+
+    client.stop();
+    Serial.println("Boom Response:");
+    Serial.println(response);
+
+    if (response.indexOf("|OPENEN%") != -1) {
+      triggerOpenBarrier();
+    } else if (response.indexOf("|OPENEX%") != -1) {
+      triggerCloseBarrier();
+    }
+  } else {
+    Serial.println("Failed to connect for boom signal.");
+  }
+}
+
+void triggerOpenBarrier() {
+  Serial.println("Opening Gate...");
+  digitalWrite(openRelayPin, LOW);
+  delay(500);
+  digitalWrite(openRelayPin, HIGH);
+}
+
+void triggerCloseBarrier() {
+  Serial.println("Closing Gate...");
+  digitalWrite(closeRelayPin, LOW);
+  delay(500);
+  digitalWrite(closeRelayPin, HIGH);
+}
+
+String extractJsonValue(String json, const char* key) {
+  int keyIndex = json.indexOf("\"" + String(key) + "\"");
+  if (keyIndex == -1) return "";
+  int colon = json.indexOf(":", keyIndex);
+  int quoteStart = json.indexOf("\"", colon);
+  int quoteEnd = json.indexOf("\"", quoteStart + 1);
+  return json.substring(quoteStart + 1, quoteEnd);
+}
+
+String ipToString(IPAddress ip) {
+  return String(ip[0]) + "." + String(ip[1]) + "." + String(ip[2]) + "." + String(ip[3]);
+}
+
+
+// server code
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import mysql.connector
+from datetime import datetime
+
+app = Flask(__name__)
+CORS(app)
+
+def get_db_connection():
+    return mysql.connector.connect(
+        host='localhost',
+        user='root',
+        password='',
+        database='auto_boom'
+    )
+
+@app.route('/register_controller', methods=['POST'])
+def register_controller():
+    try:
+        data = request.get_json()
+
+        mac = data.get("mac")
+        ip = data.get("ip")
+        gate_id = data.get("gate_id")
+        server_ip = data.get("server_ip")
+        server_port = data.get("server_port")
+        base_url = data.get("base_url")
+        password = data.get("password")
+
+        if not all([mac, ip, gate_id, server_ip, server_port, base_url, password]):
+            return jsonify({"error": "Missing one or more required fields"}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT password FROM settings WHERE username = %s", ('admin',))
+        row = cursor.fetchone()
+        if not row or row[0] != password:
+            conn.close()
+            return jsonify({"error": "Invalid admin password"}), 403
+
+        cursor.execute("SELECT id FROM controller WHERE mac = %s", (mac,))
+        controller = cursor.fetchone()
+
+        if controller:
+            cursor.execute("""
+                UPDATE controller
+                SET ip = %s, gate_id = %s, server_ip = %s, server_port = %s, base_url = %s, updated_at = NOW()
+                WHERE mac = %s
+            """, (ip, gate_id, server_ip, server_port, base_url, mac))
+        else:
+            cursor.execute("""
+                INSERT INTO controller (mac, ip, gate_id, server_ip, server_port, base_url, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+            """, (mac, ip, gate_id, server_ip, server_port, base_url))
+
+        cursor.execute("SELECT id FROM boomsig WHERE id = %s", (gate_id,))
+        if not cursor.fetchone():
+            cursor.execute("""
+                INSERT INTO boomsig (id, entryboom, entrysynctime, exitboom, exitsynctime)
+                VALUES (%s, 'N', NULL, 'N', NULL)
+            """, (gate_id,))
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({"message": "Controller registered/updated successfully"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+@app.route('/barrier_control', methods=['POST'])
+def update_boom_signal():
+    try:
+        data = request.get_json()
+        gate_id = data.get("gate_id")
+        ip = data.get("ip")
+        mac = data.get("mac")
+        action = data.get("action")
+
+        if not gate_id or not ip or not mac or action not in ["open", "close"]:
+            return jsonify({"error": "Missing or invalid gate_id, ip, mac, or action"}), 400
+
+        column_name = "entryboom" if action == "open" else "exitboom"
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Validate controller
+        cursor.execute("SELECT id FROM controller WHERE gate_id = %s AND ip = %s AND mac = %s", (gate_id, ip, mac))
+        if not cursor.fetchone():
+            conn.close()
+            return jsonify({"error": "Controller details not found or mismatched"}), 404
+
+        # Update boomsig
+        cursor.execute(f'UPDATE boomsig SET {column_name} = "Y" WHERE id = %s', (gate_id,))
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "status": f"{action} command recorded",
+            "updated_column": column_name,
+            "gate_id": gate_id,
+            "ip": ip,
+            "mac": mac
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/check_boomsig', methods=['GET'])
+def check_boom_signal():
+    gate_id = request.args.get('gate_id')
+    mac = request.args.get('mac')
+    ip = request.args.get('ip')
+
+    if not all([gate_id, mac, ip]):
+        return jsonify({"error": "Missing gate_id, mac, or ip"}), 400
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Validate controller
+        cursor.execute("SELECT id FROM controller WHERE gate_id = %s AND mac = %s AND ip = %s", (gate_id, mac, ip))
+        if not cursor.fetchone():
+            conn.close()
+            return jsonify({"error": "Invalid gate_id, mac, or ip"}), 403
+
+        # Check boomsig
+        cursor.execute('SELECT entryboom, exitboom FROM boomsig WHERE id = %s', (gate_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "Boomsig record not found"}), 404
+
+        entryboom, exitboom = row
+
+        if entryboom == 'Y':
+            cursor.execute('UPDATE boomsig SET entryboom = "N", entrysynctime = NOW() WHERE id = %s', (gate_id,))
+            conn.commit()
+            conn.close()
+            return jsonify({"command": "|OPENEN%"}), 200
+
+        elif exitboom == 'Y':
+            cursor.execute('UPDATE boomsig SET exitboom = "N", exitsynctime = NOW() WHERE id = %s', (gate_id,))
+            conn.commit()
+            conn.close()
+            return jsonify({"command": "|OPENEX%"}), 200
+
+        conn.close()
+        return jsonify({"command": "NO_ACTION"}), 200
+
+    except mysql.connector.Error as err:
+        return jsonify({"error": f"MySQL Error: {err}"}), 500
+
+
+@app.route('/update_password', methods=['POST'])
+def update_password():
+    data = request.get_json()
+    username = data.get("username")
+    old_password = data.get("old_password")
+    new_password = data.get("new_password")
+
+    if not username or not old_password or not new_password:
+        return jsonify({"error": "Missing username, old or new password"}), 400
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('SELECT password FROM settings WHERE username = %s', (username,))
+        result = cursor.fetchone()
+
+        if not result:
+            conn.close()
+            return jsonify({"error": "Username not found"}), 404
+
+        current_password = result[0]
+
+        if current_password != old_password:
+            conn.close()
+            return jsonify({"error": "Incorrect old password"}), 401
+
+        cursor.execute('UPDATE settings SET password = %s WHERE username = %s', (new_password, username))
+        conn.commit()
+        conn.close()
+
+        return jsonify({"status": "Password updated successfully"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/update_config', methods=['POST'])
+def update_config():
+    try:
+        data = request.get_json()
+        mac = data.get("mac")
+        new_ip = data.get("ip")
+        new_gate_id = data.get("gate_id")
+        server_ip = data.get("server_ip")
+        server_port = data.get("server_port")
+        base_url = data.get("base_url")
+        password = data.get("password")
+
+        # Ensure all required fields are present
+        if not all([mac, new_ip, new_gate_id, server_ip, server_port, base_url, password]):
+            return jsonify({"error": "Missing one or more required fields"}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Validate admin password
+        cursor.execute("SELECT password FROM settings WHERE username = %s", ('admin',))
+        row = cursor.fetchone()
+        if not row or row[0] != password:
+            conn.close()
+            return jsonify({"error": "Invalid admin password"}), 403
+
+        # Check if controller exists
+        cursor.execute("SELECT id FROM controller WHERE mac = %s", (mac,))
+        if not cursor.fetchone():
+            conn.close()
+            return jsonify({"error": "Controller with given MAC not found"}), 404
+
+        # Update controller
+        cursor.execute("""
+            UPDATE controller
+            SET ip = %s,
+                gate_id = %s,
+                server_ip = %s,
+                server_port = %s,
+                base_url = %s,
+                updated_at = NOW()
+            WHERE mac = %s
+        """, (new_ip, new_gate_id, server_ip, server_port, base_url, mac))
+
+        # Ensure gate_id exists in boomsig table
+        cursor.execute("SELECT id FROM boomsig WHERE id = %s", (new_gate_id,))
+        if not cursor.fetchone():
+            cursor.execute("""
+                INSERT INTO boomsig (id, entryboom, entrysynctime, exitboom, exitsynctime)
+                VALUES (%s, 'N', NULL, 'N', NULL)
+            """, (new_gate_id,))
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({"status": "Controller configuration updated successfully"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+@app.route('/delete_controller', methods=['DELETE'])
+def delete_controller():
+    try:
+        data = request.get_json()
+        controller_id = data.get("id")
+        password = data.get("password")
+
+        if not controller_id or not password:
+            return jsonify({"error": "Missing id or password"}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT password FROM settings LIMIT 1")
+        row = cursor.fetchone()
+        if not row or row[0] != password:
+            conn.close()
+            return jsonify({"error": "Invalid password"}), 403
+
+        cursor.execute("SELECT id FROM controller WHERE id = %s", (controller_id,))
+        if not cursor.fetchone():
+            conn.close()
+            return jsonify({"error": "Controller not found"}), 404
+
+        cursor.execute("DELETE FROM controller WHERE id = %s", (controller_id,))
+        conn.commit()
+        conn.close()
+
+        return jsonify({"status": f"Controller with ID {controller_id} deleted successfully"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/get_config', methods=['GET'])
+def get_config():
+    mac = request.args.get("mac")
+    if not mac:
+        return jsonify({"error": "Missing mac address"}), 400
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT ip, gate_id, server_ip, server_port, base_url
+            FROM controller WHERE mac = %s
+        """, (mac,))
+        result = cursor.fetchone()
+        conn.close()
+
+        if not result:
+            return jsonify({"error": "MAC not found"}), 404
+
+        ip, gate_id, server_ip, server_port, base_url = result
+        return jsonify({
+            "ip": ip,
+            "gate_id": gate_id,
+            "server_ip": server_ip,
+            "server_port": str(server_port),
+            "base_url": base_url
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/get_all_controllers', methods=['GET'])
+def get_all_controllers():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        query = """
+            SELECT id, mac, ip, gate_id, created_at, updated_at, server_ip, server_port, base_url
+            FROM controller
+            ORDER BY id ASC
+        """
+        cursor.execute(query)
+        controllers = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        return jsonify(controllers), 200
+
+    except mysql.connector.Error as err:
+        return jsonify({"error": f"MySQL Error: {str(err)}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Unexpected Error: {str(e)}"}), 500
+
+
+
+@app.route('/get_controller', methods=['GET'])
+def get_controller_by_gate():
+    gate_id = request.args.get("gate_id")
+    if not gate_id:
+        return jsonify({"error": "Missing gate_id"}), 400
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id, mac, gate_id, ip, created_at, updated_at FROM controller WHERE gate_id = %s", (gate_id,))
+        controller = cursor.fetchone()
+        conn.close()
+
+        if not controller:
+            return jsonify({"error": "No controller found for given gate_id"}), 404
+
+        return jsonify(controller), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8000, debug=True, threaded=True)
+
+
+import React, { useState, useEffect } from 'react';
+import { MdEdit, MdDelete } from 'react-icons/md';
+import Layout from "../Layout/Layout";
+import axios from 'axios';
+import swal from 'sweetalert2';
+import './ManageBoom.css';
+
+const ManageBoom = () => {
+  const [controllers, setControllers] = useState([]);
+  const [showModal, setShowModal] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [formData, setFormData] = useState({
+    mac: '',
+    ip: '',
+    gate_id: '',
+    server_ip: '',
+    server_port: '',
+    base_url: '',
+    password: '',
+
+  });
+
+  const [showPasswordModal, setShowPasswordModal] = useState(false);
+  const [passwordForm, setPasswordForm] = useState({
+    username: "",
+    old_password: "",
+    new_password1: "",
+    new_password2: ""
+  });
+
+  useEffect(() => {
+    fetchControllers();
+  }, []);
+
+  const fetchControllers = async () => {
+    try {
+      const res = await axios.get("http://localhost:8000/get_all_controllers");
+      setControllers(res.data);
+    } catch (error) {
+      console.error("Failed to fetch controllers:", error);
+    }
+  };
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    setFormData(prev => ({ ...prev, [name]: value }));
+  };
+
+  const handlePasswordChange = (e) => {
+    const { name, value } = e.target;
+    setPasswordForm(prev => ({ ...prev, [name]: value }));
+  };
+
+  const handleChangePassword = async (e) => {
+    e.preventDefault();
+
+    if (passwordForm.new_password1 !== passwordForm.new_password2) {
+      swal.fire("Error", "New passwords do not match", "error");
+      return;
+    }
+
+    try {
+      await axios.post("http://localhost:8000/update_password", {
+        username: passwordForm.username,
+        old_password: passwordForm.old_password,
+        new_password: passwordForm.new_password1
+      });
+
+      swal.fire('Success', 'Password changed successfully', 'success');
+      setShowPasswordModal(false);
+      setPasswordForm({
+        username: "", old_password: "", new_password1: "", new_password2: ""
+      });
+    } catch (error) {
+      console.error(error);
+      swal.fire("Error", error.response?.data?.error || error.message, "error");
+    }
+  };
+
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+
+    try {
+      if (editingId === null) {
+        // Create new controller — no password required
+        await axios.post("http://localhost:8000/register_controller", {
+          mac: formData.mac,
+          ip: formData.ip,
+          gate_id: formData.gate_id,
+          server_ip: '',
+          server_port: '',
+          base_url: '',
+        });
+
+        swal.fire("Success", "Controller registered successfully", "success");
+      } else {
+        // Update existing controller — password required
+        await axios.post("http://localhost:8000/update_config", formData);
+        swal.fire("Success", "Controller updated successfully", "success");
+      }
+
+      fetchControllers(); // Refresh the table
+      setShowModal(false);
+      setFormData({ mac: "", ip: "", gate_id: "", password: "" });
+      setEditingId(null);
+    } catch (error) {
+      console.error(error);
+      swal.fire("Error", error.response?.data?.error || "Operation failed", "error");
+    }
+  };
+
+
+  const handleEdit = (controller) => {
+    setFormData({
+      mac: controller.mac,
+      ip: controller.ip,
+      gate_id: controller.gate_id,
+      server_ip: controller.server_ip,
+      server_port: controller.server_port,
+      base_url: controller.base_url,
+      password: ""
+    });
+    setEditingId(controller.id);
+    setShowModal(true);
+  };
+
+  const handleDelete = async (id) => {
+    const result = await swal.fire({
+      title: 'Are you sure?',
+      text: 'This will permanently delete the controller.',
+      icon: 'warning',
+      showCancelButton: true,
+      confirmButtonText: 'Yes, delete it!',
+      cancelButtonText: 'Cancel'
+    });
+
+    if (result.isConfirmed) {
+      const { value: password } = await swal.fire({
+        title: 'Enter password to confirm',
+        input: 'password',
+        inputPlaceholder: 'Enter admin password',
+        inputAttributes: {
+          autocapitalize: 'off',
+          autocorrect: 'off'
+        },
+        showCancelButton: true
+      });
+
+      if (password) {
+        try {
+          await axios.delete("http://localhost:8000/delete_controller", {
+            data: { id, password }
+          });
+          swal.fire('Deleted!', 'Controller has been deleted.', 'success');
+          fetchControllers();
+        } catch (error) {
+          console.error(error);
+          swal.fire("Error", error.response?.data?.error || "Delete failed", "error");
+        }
+      }
+    }
+  };
+
+  return (
+    <Layout>
+      <div className="operator-container">
+        <div className="operator-header">
+          <h2>🚦 Boom Controller Management</h2>
+          <button onClick={() => {
+            setShowModal(true);
+            setEditingId(null);
+            setFormData({ mac: "", ip: "", gate_id: "", password: "" });
+          }}>
+            ➕ Add New Controller
+          </button>
+          <button
+            onClick={() => {
+              setShowPasswordModal(true);
+              setPasswordForm({
+                username: "", old_password: "", new_password1: "", new_password2: ""
+              });
+            }}
+          >
+            Change Admin Password
+          </button>
+        </div>
+
+        <div className="operator-table-wrapper">
+          <table className="operator-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>MAC Address</th>
+                <th>IP Address</th>
+                <th>Gate ID</th>
+                <th>Server Ip</th>
+                <th>Server Port</th>
+                <th>Url</th>
+                <td>Created At</td>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {controllers.map((c, idx) => (
+                <tr key={c.id}>
+                  <td>{idx + 1}</td>
+                  <td>{c.mac}</td>
+                  <td>{c.ip}</td>
+                  <td>{c.gate_id}</td>
+                  <td>{c.server_ip}</td>
+                  <td>{c.server_port}</td>
+                  <td>{c.base_url}</td>
+
+                  <td>{new Date(c.created_at).toLocaleString('en-IN', {
+                    timeZone: 'Asia/Kolkata',
+                    day: '2-digit', month: '2-digit', year: 'numeric',
+                    hour: '2-digit', minute: '2-digit', second: '2-digit',
+                    hour12: true
+                  })}</td>
+                  <td className="flex gap-2">
+                    <button onClick={() => handleEdit(c)} className="text-green-600 hover:text-green-800">
+                      <MdEdit size={18} />
+                    </button>
+                    <button onClick={() => handleDelete(c.id)} className="text-red-600 hover:text-red-800">
+                      <MdDelete size={18} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {controllers.length === 0 && (
+                <tr><td colSpan="7" style={{ textAlign: 'center' }}>No controllers found.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Modal for Add/Edit Controller */}
+        {showModal && (
+          <div className="modal-overlay">
+            <div className="modal-content">
+              <h3>{editingId ? "Edit Controller" : "Add Controller"}</h3>
+              <form onSubmit={handleSubmit}>
+                <input type="text" name="mac" value={formData.mac} onChange={handleChange} placeholder="MAC Address" required readOnly={!!editingId} />
+                <input type="text" name="ip" value={formData.ip} onChange={handleChange} placeholder="IP Address" required />
+                <input type="text" name="gate_id" value={formData.gate_id} onChange={handleChange} placeholder="Gate ID" required />
+                <input type="text" name="server_ip" value={formData.server_ip} onChange={handleChange} placeholder="Server IP" required />
+                <input type="text" name="server_port" value={formData.server_port} onChange={handleChange} placeholder="Server Port" required />
+                <input type="text" name="base_url" value={formData.base_url} onChange={handleChange} placeholder="Base URL" required />
+                <input type="password" name="password" value={formData.password} onChange={handleChange} placeholder="Admin Password" required />
+                <div className="modal-buttons">
+                  <button type="button" onClick={() => setShowModal(false)}>Cancel</button>
+                  <button type="submit">{editingId ? "Update" : "Create"}</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* Modal for Change Password */}
+        {showPasswordModal && (
+          <div className="modal-overlay">
+            <div className="modal-content">
+              <h3>Change Admin Password</h3>
+              <form onSubmit={handleChangePassword}>
+                <input type="text" name="username" value={passwordForm.username} onChange={handlePasswordChange} placeholder="Username" required />
+                <input type="password" name="old_password" value={passwordForm.old_password} onChange={handlePasswordChange} placeholder="Old Password" required />
+                <input type="password" name="new_password1" value={passwordForm.new_password1} onChange={handlePasswordChange} placeholder="New Password" required />
+                <input type="password" name="new_password2" value={passwordForm.new_password2} onChange={handlePasswordChange} placeholder="Confirm New Password" required />
+                <div className="modal-buttons">
+                  <button type="button" onClick={() => setShowPasswordModal(false)}>Cancel</button>
+                  <button type="submit">Change Password</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+      </div>
+    </Layout>
+  );
+};
+
+export default ManageBoom;
+
+.operator-container {
+    padding: 20px;
+    font-family: sans-serif;
+}
+
+.operator-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+
+.operator-header h2 {
+    margin: 0;
+    font-size: 24px;
+}
+
+.add-operator-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background-color: #403E92;
+    color: white;
+    padding: 10px 15px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.add-operator-btn:hover {
+    background-color: #2f2e6e;
+}
+
+.operator-table-wrapper {
+    overflow-x: auto;
+    background-color: white;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+}
+
+.operator-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.operator-table th,
+.operator-table td {
+    padding: 12px;
+    border: 1px solid #eee;
+    text-align: left;
+}
+
+.operator-table th {
+    background-color: #f5f5f5;
+}
+
+.actions {
+    display: flex;
+    gap: 10px;
+}
+
+.edit-btn, .delete-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+}
+
+.edit-btn {
+    color: blue;
+}
+
+.delete-btn {
+    color: red;
+}
+
+.no-data {
+    text-align: center;
+    color: gray;
+    padding: 20px;
+}
+
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 999;
+}
+
+.modal-content {
+    background-color: white;
+    padding: 30px;
+    border-radius: 10px;
+    width: 100%;
+    max-width: 400px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+.modal-content h3 {
+    margin-bottom: 20px;
+}
+
+.modal-content input {
+    width: 100%;
+    padding: 10px;
+    margin-bottom: 12px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+}
+
+.modal-buttons {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 10px;
+}
+
+.modal-buttons button {
+    padding: 8px 14px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+}
+
+.modal-buttons button:first-child {
+    background-color: #ddd;
+    color: #333;
+}
+
+.modal-buttons button:last-child {
+    background-color: #403E92;
+    color: white;
+}
+
+.modal-buttons button:last-child:hover {
+    background-color: #2f2e6e;
+}
