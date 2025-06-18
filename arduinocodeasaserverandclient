@@ -1,4 +1,5 @@
-// africa deployed code and it is working. this is dynamic we can change the gate_id through webpage. and it's password set is admin. 
+// africa deployed code and it is working. this is dynamic we can change the gate_id through webpage. and it's password set is admin.in this my
+arduino will act as a local server. we can change the gate_id locally not from anywhere in the world 
 #include <SPI.h>
 #include <Ethernet.h>
 #include <EEPROM.h>
