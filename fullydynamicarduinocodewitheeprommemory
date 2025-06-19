@@ -273,6 +273,313 @@ String ipToString(IPAddress ip) {
 }
 
 
+//version-2 auto reset after detecting the change in the database by version column in controller table
+#include <SPI.h>
+#include <Ethernet.h>
+#include <EEPROM.h>
+
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x01 };
+const char macStr[] = "DE:AD:BE:EF:FE:01";
+
+IPAddress fallbackIP(192, 168, 1, 151);
+IPAddress fallbackConfigServerIP(192,168,1,100);
+int fallbackConfigServerPort = 8000;
+
+EthernetClient client;
+
+const int openRelayPin = 9;
+const int closeRelayPin = 8;
+
+const unsigned long reconnectDelay = 1000;
+const unsigned long readTimeout = 2000;
+unsigned long lastCheckTime = 0;
+unsigned long lastConfigCheck = 0;
+const unsigned long configCheckInterval = 5 * 60 * 1000UL;
+
+struct DynamicConfig {
+  IPAddress deviceIP;
+  char gate_id[16];
+  char server[32];
+  int port;
+  char base_url[128];
+  char config_server[32];
+  int config_port;
+  char version[8];
+} config;
+
+struct ServerConfig {
+  char server_ip[16];
+  uint16_t server_port;
+  char base_url[64];
+  char version[8];
+};
+
+void(* resetFunc) (void) = 0;  // for soft reset
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(openRelayPin, OUTPUT);
+  pinMode(closeRelayPin, OUTPUT);
+  digitalWrite(openRelayPin, HIGH);
+  digitalWrite(closeRelayPin, HIGH);
+
+  Ethernet.begin(mac, fallbackIP);
+  delay(2000);
+
+  bool configLoaded = loadServerConfigFromEEPROM();
+  bool success = false;
+
+  if (configLoaded) {
+    Serial.println("EEPROM config found, trying to connect to saved server...");
+    success = tryFetchFromServer(config.server, config.port, 5);
+  }
+
+  if (!success) {
+    Serial.println("Using fallback server to fetch config...");
+    while (!fetchConfig(fallbackConfigServerIP, fallbackConfigServerPort)) {
+      Serial.println("Retrying config fetch from fallback in 5 seconds...");
+      delay(5000);
+    }
+    saveServerConfigToEEPROM();  // Save fallback-fetched config
+  }
+
+  Ethernet.begin(mac, config.deviceIP);
+  delay(2000);
+
+  Serial.print("Device IP: ");
+  Serial.println(Ethernet.localIP());
+
+  lastCheckTime = millis();
+}
+
+void loop() {
+  if (millis() - lastCheckTime >= reconnectDelay) {
+    if (strlen(config.server) > 6 && config.port > 0) {
+      checkBoomSignal();
+    } else {
+      Serial.println("Invalid config, skipping boom check...");
+    }
+    lastCheckTime = millis();
+  }
+
+  if (millis() - lastConfigCheck >= configCheckInterval) {
+    checkForConfigUpdate();
+    lastConfigCheck = millis();
+  }
+}
+
+bool tryFetchFromServer(const char* serverIP, int port, int maxAttempts) {
+  IPAddress ip;
+  int ip1, ip2, ip3, ip4;
+
+  if (sscanf(serverIP, "%d.%d.%d.%d", &ip1, &ip2, &ip3, &ip4) != 4) {
+    Serial.println("Invalid IP format in EEPROM.");
+    return false;
+  }
+
+  ip = IPAddress(ip1, ip2, ip3, ip4);
+
+  for (int i = 0; i < maxAttempts; i++) {
+    Serial.print("Attempt ");
+    Serial.print(i + 1);
+    Serial.print(" to fetch config from saved server... ");
+    if (fetchConfig(ip, port)) {
+      Serial.println("Success.");
+      saveServerConfigToEEPROM();
+      return true;
+    } else {
+      Serial.println("Failed.");
+      delay(3000);
+    }
+  }
+  return false;
+}
+
+bool loadServerConfigFromEEPROM() {
+  ServerConfig s;
+  EEPROM.get(0, s);
+
+  if (s.server_ip[0] == 0xFF || s.server_ip[0] == '\0') return false;
+
+  strncpy(config.server, s.server_ip, sizeof(config.server));
+  config.port = s.server_port;
+  strncpy(config.base_url, s.base_url, sizeof(config.base_url));
+  strncpy(config.version, s.version, sizeof(config.version));
+
+  Serial.println("Loaded config from EEPROM:");
+  Serial.print("Server IP: "); Serial.println(config.server);
+  Serial.print("Port: "); Serial.println(config.port);
+  Serial.print("Base URL: "); Serial.println(config.base_url);
+  Serial.print("Version: "); Serial.println(config.version);
+  return true;
+}
+
+void saveServerConfigToEEPROM() {
+  ServerConfig s;
+  strncpy(s.server_ip, config.server, sizeof(s.server_ip));
+  s.server_port = config.port;
+  strncpy(s.base_url, config.base_url, sizeof(s.base_url));
+  strncpy(s.version, config.version, sizeof(s.version));
+  EEPROM.put(0, s);
+  Serial.println("Saved server config to EEPROM.");
+}
+
+bool fetchConfig(IPAddress configServerIP, int configPort) {
+  client.stop();
+
+  if (client.connect(configServerIP, configPort)) {
+    String url = "/get_config?mac=" + String(macStr);
+    client.print("GET " + url + " HTTP/1.1\r\n");
+    client.print("Host: " + ipToString(configServerIP) + "\r\n");
+    client.print("Connection: close\r\n\r\n");
+
+    unsigned long start = millis();
+    String response = "";
+
+    while (millis() - start < readTimeout) {
+      while (client.available()) {
+        char c = client.read();
+        response += c;
+        start = millis();
+      }
+    }
+    client.stop();
+
+    Serial.println("Config Response:");
+    Serial.println(response);
+
+    int jsonStart = response.indexOf('{');
+    int jsonEnd = response.lastIndexOf('}');
+    if (jsonStart == -1 || jsonEnd == -1 || jsonEnd <= jsonStart) return false;
+
+    String json = response.substring(jsonStart, jsonEnd + 1);
+    String ipStr = extractJsonValue(json, "ip");
+    String gidStr = extractJsonValue(json, "gate_id");
+    String srvStr = extractJsonValue(json, "server_ip");
+    String portStr = extractJsonValue(json, "server_port");
+    String apiStr = extractJsonValue(json, "base_url");
+    String verStr = extractJsonValue(json, "version");
+
+    int ip1, ip2, ip3, ip4;
+    if (sscanf(ipStr.c_str(), "%d.%d.%d.%d", &ip1, &ip2, &ip3, &ip4) != 4) return false;
+    config.deviceIP = IPAddress(ip1, ip2, ip3, ip4);
+
+    gidStr.toCharArray(config.gate_id, sizeof(config.gate_id));
+    srvStr.toCharArray(config.server, sizeof(config.server));
+    config.port = portStr.toInt();
+    apiStr.toCharArray(config.base_url, sizeof(config.base_url));
+    verStr.toCharArray(config.version, sizeof(config.version));
+
+    srvStr.toCharArray(config.config_server, sizeof(config.config_server));
+    config.config_port = portStr.toInt();
+
+    return true;
+  } else {
+    Serial.println("Failed to connect to config API.");
+    return false;
+  }
+}
+
+void checkForConfigUpdate() {
+  Serial.println("Checking for config update...");
+  IPAddress configIP;
+  int ip1, ip2, ip3, ip4;
+  if (sscanf(config.config_server, "%d.%d.%d.%d", &ip1, &ip2, &ip3, &ip4) != 4) {
+    Serial.println("Invalid config server IP.");
+    return;
+  }
+  configIP = IPAddress(ip1, ip2, ip3, ip4);
+
+  char oldVersion[8];
+  strncpy(oldVersion, config.version, sizeof(oldVersion));
+
+  if (fetchConfig(configIP, config.config_port)) {
+    if (strcmp(oldVersion, config.version) != 0) {
+      Serial.print("Version changed from ");
+      Serial.print(oldVersion);
+      Serial.print(" to ");
+      Serial.println(config.version);
+      saveServerConfigToEEPROM();
+      delay(500);
+      resetFunc();
+    } else {
+      Serial.println("Version unchanged.");
+    }
+  } else {
+    Serial.println("Failed to fetch config for update.");
+  }
+}
+
+void checkBoomSignal() {
+  client.stop();
+
+  IPAddress serverIP;
+  int ip1, ip2, ip3, ip4;
+  if (sscanf(config.server, "%d.%d.%d.%d", &ip1, &ip2, &ip3, &ip4) != 4) {
+    Serial.print("Invalid server IP: ");
+    Serial.println(config.server);
+    return;
+  }
+  serverIP = IPAddress(ip1, ip2, ip3, ip4);
+
+  if (client.connect(serverIP, config.port)) {
+    String ipStr = ipToString(config.deviceIP);
+    String url = "/check_boomsig?mac=" + String(macStr) + "&ip=" + ipStr + "&gate_id=" + String(config.gate_id);
+
+    client.print("GET " + url + " HTTP/1.1\r\n");
+    client.print("Host: " + String(config.server) + "\r\n");
+    client.print("Connection: close\r\n\r\n");
+
+    unsigned long start = millis();
+    String response = "";
+
+    while (millis() - start < readTimeout) {
+      while (client.available()) {
+        char c = client.read();
+        response += c;
+        start = millis();
+      }
+    }
+
+    client.stop();
+    if (response.indexOf("|OPENEN%") != -1) {
+      triggerOpenBarrier();
+    } else if (response.indexOf("|OPENEX%") != -1) {
+      triggerCloseBarrier();
+    }
+  } else {
+    Serial.println("Failed to connect for boom signal.");
+  }
+}
+
+void triggerOpenBarrier() {
+  Serial.println("Opening Gate...");
+  digitalWrite(openRelayPin, LOW);
+  delay(500);
+  digitalWrite(openRelayPin, HIGH);
+}
+
+void triggerCloseBarrier() {
+  Serial.println("Closing Gate...");
+  digitalWrite(closeRelayPin, LOW);
+  delay(500);
+  digitalWrite(closeRelayPin, HIGH);
+}
+
+String extractJsonValue(String json, const char* key) {
+  int keyIndex = json.indexOf("\"" + String(key) + "\"");
+  if (keyIndex == -1) return "";
+  int colon = json.indexOf(":", keyIndex);
+  int quoteStart = json.indexOf("\"", colon);
+  int quoteEnd = json.indexOf("\"", quoteStart + 1);
+  return json.substring(quoteStart + 1, quoteEnd);
+}
+
+String ipToString(IPAddress ip) {
+  return String(ip[0]) + "." + String(ip[1]) + "." + String(ip[2]) + "." + String(ip[3]);
+}
+
 // server code
 from flask import Flask, request, jsonify
 from flask_cors import CORS
